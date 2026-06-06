@@ -87,6 +87,19 @@ async function initDB() {
             )
         `);
 
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS comments (
+                id SERIAL PRIMARY KEY,
+                "productTitle" TEXT NOT NULL,
+                text TEXT NOT NULL,
+                author TEXT NOT NULL DEFAULT 'Guest',
+                "authorId" TEXT,
+                "parentId" INTEGER REFERENCES comments(id) ON DELETE CASCADE,
+                date TEXT,
+                "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
         const sampleProducts = [
             // Flowers
             { title: 'Rose Bouquet', price: 500, img: 'assets/flowers/rose-bouquet.jpg', description: 'A classic choice for expressing deep love and romance.', category: 'flower' },
@@ -343,6 +356,77 @@ app.post('/api/ratings', async (req, res) => {
             `, [productTitle, ratingValue, comment || '']);
             res.json({ message: 'Rating submitted successfully', id: result.rows[0].id });
         }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+// Get all comments for a product
+app.get('/api/comments/:productTitle', async (req, res) => {
+    const { productTitle } = req.params;
+    try {
+        const result = await pool.query(
+            `SELECT * FROM comments WHERE "productTitle" = $1 ORDER BY "createdAt" ASC`,
+            [decodeURIComponent(productTitle)]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Post a new comment or reply
+app.post('/api/comments', async (req, res) => {
+    const { productTitle, text, author, authorId, parentId, date } = req.body;
+    if (!productTitle || !text) return res.status(400).json({ error: 'Missing required fields.' });
+    try {
+        const result = await pool.query(`
+            INSERT INTO comments ("productTitle", text, author, "authorId", "parentId", date)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING *
+        `, [
+            productTitle,
+            text,
+            author || 'Guest',
+            authorId ? String(authorId) : null,
+            parentId || null,
+            date || new Date().toLocaleDateString()
+        ]);
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Edit a comment (owner only)
+app.put('/api/comments/:id', async (req, res) => {
+    const { id } = req.params;
+    const { text, authorId } = req.body;
+    if (!text) return res.status(400).json({ error: 'Missing text.' });
+    try {
+        const result = await pool.query(
+            `UPDATE comments SET text = $1 WHERE id = $2 AND "authorId" = $3 RETURNING *`,
+            [text, id, String(authorId)]
+        );
+        if (!result.rows.length) return res.status(403).json({ error: 'Not authorized or comment not found.' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete a comment (owner only) — replies auto-deleted via ON DELETE CASCADE
+app.delete('/api/comments/:id', async (req, res) => {
+    const { id } = req.params;
+    const { authorId } = req.body;
+    try {
+        const result = await pool.query(
+            `DELETE FROM comments WHERE id = $1 AND "authorId" = $2 RETURNING id`,
+            [id, String(authorId)]
+        );
+        if (!result.rows.length) return res.status(403).json({ error: 'Not authorized or comment not found.' });
+        res.json({ message: 'Comment deleted.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
