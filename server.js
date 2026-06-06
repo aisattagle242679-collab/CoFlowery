@@ -1,0 +1,361 @@
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
+
+// Connect to PostgreSQL cloud database via environment variable
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
+
+// Initialize tables and seed product data
+async function initDB() {
+    const client = await pool.connect();
+    try {
+        // Drop and recreate products table on every start (keeps catalog fresh)
+        await client.query(`DROP TABLE IF EXISTS products`);
+
+        await client.query(`
+            CREATE TABLE products (
+                id SERIAL PRIMARY KEY,
+                title TEXT UNIQUE NOT NULL,
+                price REAL NOT NULL,
+                img TEXT NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS profiles (
+                "userId" INTEGER PRIMARY KEY REFERENCES users(id),
+                "fullName" TEXT,
+                phone TEXT,
+                country TEXT,
+                address1 TEXT,
+                address2 TEXT,
+                city TEXT,
+                province TEXT,
+                "postalCode" TEXT,
+                notes TEXT
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                "userId" INTEGER REFERENCES users(id),
+                "orderId" TEXT UNIQUE NOT NULL,
+                date TEXT NOT NULL,
+                items TEXT NOT NULL,
+                subtotal REAL NOT NULL,
+                shipping REAL NOT NULL,
+                discount REAL NOT NULL,
+                total REAL NOT NULL,
+                "paymentType" TEXT,
+                "voucherCode" TEXT,
+                status TEXT,
+                estimate TEXT,
+                "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS ratings (
+                id SERIAL PRIMARY KEY,
+                "userId" INTEGER REFERENCES users(id),
+                "productTitle" TEXT NOT NULL,
+                "ratingValue" INTEGER NOT NULL CHECK("ratingValue" BETWEEN 1 AND 5),
+                comment TEXT,
+                "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE("userId", "productTitle")
+            )
+        `);
+
+        const sampleProducts = [
+            // Flowers
+            { title: 'Rose Bouquet', price: 500, img: 'assets/flowers/rose-bouquet.jpg', description: 'A classic choice for expressing deep love and romance.', category: 'flower' },
+            { title: 'Tulip Bouquet', price: 200, img: 'assets/flowers/tulip-bouquet.jpg', description: 'Vibrant and fresh, symbolizing perfect love.', category: 'flower' },
+            { title: 'Sunflower Bouquet', price: 300, img: 'assets/flowers/sunflower-bouquet.jpg', description: 'Bright and cheerful, perfect for spreading joy.', category: 'flower' },
+            { title: 'Orchid Bouquet', price: 200, img: 'assets/flowers/orchid-bouquet.jpg', description: 'Elegant and delicate, symbolizing luxury and beauty.', category: 'flower' },
+            { title: 'Lily Bouquet', price: 250, img: 'assets/flowers/lily-bouquet.jpg', description: 'Pure and elegant lilies for any occasion.', category: 'flower' },
+            // Coffee
+            { title: 'Americano', price: 75.00, img: 'assets/coffees/americano.jpg', description: 'Bold and refreshing espresso diluted with hot water.', category: 'coffee' },
+            { title: 'Latte', price: 95.00, img: 'assets/coffees/latte.jpg', description: 'Smooth espresso with steamed milk and a thin layer of foam.', category: 'coffee' },
+            { title: 'Cappuccino', price: 90.00, img: 'assets/coffees/cappuccino.jpg', description: 'Equal parts espresso, steamed milk, and milk foam.', category: 'coffee' },
+            { title: 'Espresso', price: 55, img: 'assets/coffees/espresso.jpg', description: 'A rich, concentrated shot for pure coffee intensity.', category: 'coffee' },
+            { title: 'Mocha', price: 110.00, img: 'assets/coffees/mocha.jpg', description: 'A sweet blend of espresso, chocolate, and steamed milk.', category: 'coffee' },
+            // Desserts
+            { title: 'Brownies', price: 70, img: 'assets/desserts/brownies.jpg', description: 'Fudgy and rich, perfect warmed up with coffee.', category: 'dessert' },
+            { title: 'Chocolate Cake', price: 65, img: 'assets/desserts/choccake.jpg', description: 'Moist, decadent layers of pure chocolate.', category: 'dessert' },
+            { title: 'Crossini', price: 55, img: 'assets/desserts/crossini.jpg', description: 'Flaky pastry, light and airy, ideal with cappuccino.', category: 'dessert' },
+            { title: 'Cheesecake', price: 75, img: 'assets/desserts/cheesecake.jpg', description: 'Creamy, tangy, and served on a graham crust.', category: 'dessert' },
+            { title: 'Macarons', price: 85, img: 'assets/desserts/macarons.jpg', description: 'Sweet meringue-based confection with ganache filling.', category: 'dessert' },
+            // Promos
+            { title: 'Latte Promo', price: 70, img: 'https://via.placeholder.com/300x200?text=Promo+Latte', description: 'Special discount on our best-selling Latte.', category: 'promo' },
+            { title: 'Cappuccino Promo', price: 65, img: 'https://via.placeholder.com/300x200?text=Promo+Cappuccino', description: 'Limited time offer: enjoy a complimentary pastry.', category: 'promo' },
+            { title: 'Espresso Promo', price: 55, img: 'https://via.placeholder.com/300x200?text=Promo+Espresso', description: 'Double-shot special for an extra kickstart.', category: 'promo' },
+            { title: 'Mocha Promo', price: 75, img: 'https://via.placeholder.com/300x200?text=Promo+Mocha', description: 'Save big on our delicious chocolate mocha.', category: 'promo' },
+            { title: 'Cake Promo', price: 50, img: 'https://via.placeholder.com/300x200?text=Promo+Cake', description: 'Discounted slices at the end of the day.', category: 'promo' }
+        ];
+
+        for (const p of sampleProducts) {
+            await client.query(
+                `INSERT INTO products (title, price, img, description, category)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`,
+                [p.title, p.price, p.img, p.description, p.category]
+            );
+        }
+
+        console.log('Cloud database initialized. ☁️');
+    } finally {
+        client.release();
+    }
+}
+
+// 3. API Routes
+
+// Get all products
+app.get('/api/products', async (req, res) => {
+    try {
+        const result = await pool.query(`SELECT * FROM products`);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get featured products by rating and order popularity
+app.get('/api/featured', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT p.*,
+                   COALESCE(r."avgRating", 0) AS "averageRating",
+                   COALESCE(r."ratingCount", 0) AS "ratingCount"
+            FROM products p
+            LEFT JOIN (
+                SELECT "productTitle",
+                       AVG("ratingValue") AS "avgRating",
+                       COUNT(*) AS "ratingCount"
+                FROM ratings
+                GROUP BY "productTitle"
+            ) r ON r."productTitle" = p.title
+            ORDER BY "averageRating" DESC, "ratingCount" DESC, p.title ASC
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Signup new user
+app.post('/api/signup', async (req, res) => {
+    const { username, email, password } = req.body;
+    try {
+        const result = await pool.query(
+            `INSERT INTO users (username, email, password) VALUES ($1, $2, $3) RETURNING id`,
+            [username, email, password]
+        );
+        res.status(201).json({ message: 'User created successfully', id: result.rows[0].id });
+    } catch (err) {
+        if (err.code === '23505') {
+            return res.status(400).json({ error: 'Username or email already exists.' });
+        }
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Login existing user
+app.post('/api/login', async (req, res) => {
+    const { identifier, password } = req.body;
+    try {
+        const result = await pool.query(
+            `SELECT * FROM users WHERE (username = $1 OR email = $1) AND password = $2`,
+            [identifier, password]
+        );
+        if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid username or password.' });
+        const row = result.rows[0];
+        res.json({ message: 'Login successful', user: { id: row.id, username: row.username, email: row.email } });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get account profile data
+app.get('/api/account/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query(`
+            SELECT u.id, u.username, u.email,
+                   p."fullName", p.phone, p.country, p.address1, p.address2,
+                   p.city, p.province, p."postalCode", p.notes
+            FROM users u
+            LEFT JOIN profiles p ON u.id = p."userId"
+            WHERE u.id = $1
+        `, [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Profile not found.' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Save account profile data
+app.post('/api/account', async (req, res) => {
+    const { id, username, email, fullName, phone, country, address1, address2, city, province, postalCode, notes } = req.body;
+    if (!id) return res.status(400).json({ error: 'Missing user id.' });
+    try {
+        await pool.query(
+            `UPDATE users SET username = $1, email = $2 WHERE id = $3`,
+            [username, email, id]
+        );
+        await pool.query(`
+            INSERT INTO profiles ("userId", "fullName", phone, country, address1, address2, city, province, "postalCode", notes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT ("userId") DO UPDATE SET
+                "fullName"   = EXCLUDED."fullName",
+                phone        = EXCLUDED.phone,
+                country      = EXCLUDED.country,
+                address1     = EXCLUDED.address1,
+                address2     = EXCLUDED.address2,
+                city         = EXCLUDED.city,
+                province     = EXCLUDED.province,
+                "postalCode" = EXCLUDED."postalCode",
+                notes        = EXCLUDED.notes
+        `, [id, fullName || '', phone || '', country || '', address1 || '', address2 || '', city || '', province || '', postalCode || '', notes || '']);
+        res.json({ message: 'Profile saved.', user: { id, username, email } });
+    } catch (err) {
+        if (err.code === '23505') {
+            return res.status(400).json({ error: 'Username or email already exists.' });
+        }
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Save order data
+app.post('/api/orders', async (req, res) => {
+    const { userId, orderId, date, items, subtotal, shipping, discount, total, paymentType, voucherCode, status, estimate } = req.body;
+    if (!orderId || !date || !items || typeof subtotal !== 'number' || typeof total !== 'number') {
+        return res.status(400).json({ error: 'Incomplete order payload.' });
+    }
+    try {
+        const result = await pool.query(`
+            INSERT INTO orders (
+                "userId", "orderId", date, items, subtotal,
+                shipping, discount, total, "paymentType",
+                "voucherCode", status, estimate
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING id
+        `, [
+            userId || null,
+            orderId,
+            date,
+            JSON.stringify(items),
+            subtotal,
+            shipping,
+            discount,
+            total,
+            paymentType || 'Cash on Delivery',
+            voucherCode || '',
+            status || 'Preparing',
+            estimate || ''
+        ]);
+        res.status(201).json({ message: 'Order saved.', orderId, id: result.rows[0].id });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get orders for a user
+app.get('/api/orders/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const result = await pool.query(
+            `SELECT * FROM orders WHERE "userId" = $1 ORDER BY "createdAt" DESC`,
+            [userId]
+        );
+        const orders = result.rows.map(row => ({ ...row, items: JSON.parse(row.items || '[]') }));
+        res.json(orders);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get average rating for a product
+app.get('/api/ratings/:title', async (req, res) => {
+    const { title } = req.params;
+    try {
+        const result = await pool.query(`
+            SELECT AVG("ratingValue") AS average, COUNT(*) AS count
+            FROM (
+                SELECT DISTINCT ON (COALESCE("userId"::text, id::text)) "ratingValue"
+                FROM ratings
+                WHERE "productTitle" = $1
+                ORDER BY COALESCE("userId"::text, id::text), id DESC
+            ) sub
+        `, [title]);
+        const row = result.rows[0];
+        const average = row && row.average ? parseFloat(row.average).toFixed(1) : 4.5;
+        const count = row ? parseInt(row.count) : 0;
+        res.json({ average: parseFloat(average), count });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Submit a new rating
+app.post('/api/ratings', async (req, res) => {
+    const { userId, productTitle, ratingValue, comment } = req.body;
+    if (!productTitle || !ratingValue || ratingValue < 1 || ratingValue > 5) {
+        return res.status(400).json({ error: 'Invalid rating data.' });
+    }
+    try {
+        if (userId) {
+            await pool.query(`
+                INSERT INTO ratings ("userId", "productTitle", "ratingValue", comment)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT ("userId", "productTitle") DO UPDATE SET
+                    "ratingValue" = EXCLUDED."ratingValue",
+                    comment       = EXCLUDED.comment,
+                    "createdAt"   = CURRENT_TIMESTAMP
+            `, [userId, productTitle, ratingValue, comment || '']);
+            res.json({ message: 'Rating submitted successfully' });
+        } else {
+            const result = await pool.query(`
+                INSERT INTO ratings ("userId", "productTitle", "ratingValue", comment)
+                VALUES (NULL, $1, $2, $3)
+                RETURNING id
+            `, [productTitle, ratingValue, comment || '']);
+            res.json({ message: 'Rating submitted successfully', id: result.rows[0].id });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Start server after DB is ready
+initDB()
+    .then(() => {
+        app.listen(PORT, () => {
+            console.log(`Backend API live at http://localhost:${PORT}`);
+        });
+    })
+    .catch(err => {
+        console.error('Failed to initialize database:', err);
+        process.exit(1);
+    });
