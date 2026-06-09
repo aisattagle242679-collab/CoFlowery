@@ -436,6 +436,175 @@ app.delete('/api/comments/:id', async (req, res) => {
     }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN ROUTES
+// Simple username-based guard: only the 'admin' account can call these.
+// In production, use JWT or session middleware instead.
+// ─────────────────────────────────────────────────────────────────────────────
+const ADMIN_USERNAMES = new Set(['admin']);
+
+async function requireAdmin(req, res, next) {
+    // Expect header: X-Admin-Username: admin
+    const username = (req.headers['x-admin-username'] || '').toLowerCase();
+    if (!ADMIN_USERNAMES.has(username)) {
+        return res.status(403).json({ error: 'Admin access required.' });
+    }
+    next();
+}
+
+// Get ALL orders (admin)
+app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT o.*, u.username FROM orders o
+             LEFT JOIN users u ON o."userId" = u.id
+             ORDER BY o."createdAt" DESC`
+        );
+        const orders = result.rows.map(row => ({ ...row, items: JSON.parse(row.items || '[]') }));
+        res.json(orders);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Update order status (admin)
+app.put('/api/admin/orders/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { status, estimate } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE orders SET status = $1, estimate = $2 WHERE id = $3 RETURNING id`,
+            [status || 'Preparing', estimate || '', id]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Order not found.' });
+        res.json({ message: 'Order updated.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get ALL comments across all products (admin)
+app.get('/api/admin/comments', requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT * FROM comments ORDER BY "createdAt" DESC`
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete any comment by ID (admin, bypasses authorId check)
+app.delete('/api/admin/comments/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query(
+            `DELETE FROM comments WHERE id = $1 RETURNING id`, [id]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Comment not found.' });
+        res.json({ message: 'Comment deleted.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get ALL users (admin) — passwords excluded
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT id, username, email FROM users ORDER BY id ASC`
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Add a new product (admin)
+app.post('/api/products', requireAdmin, async (req, res) => {
+    const { title, price, img, description, category } = req.body;
+    if (!title || !price || !img || !description || !category) {
+        return res.status(400).json({ error: 'All product fields are required.' });
+    }
+    try {
+        const result = await pool.query(
+            `INSERT INTO products (title, price, img, description, category)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+            [title, price, img, description, category]
+        );
+        res.status(201).json({ message: 'Product added.', id: result.rows[0].id });
+    } catch (err) {
+        if (err.code === '23505') return res.status(400).json({ error: 'A product with this title already exists.' });
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Update a product (admin)
+app.put('/api/products/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { title, price, img, description, category } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE products SET title=$1, price=$2, img=$3, description=$4, category=$5
+             WHERE id=$6 RETURNING id`,
+            [title, price, img, description, category, id]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Product not found.' });
+        res.json({ message: 'Product updated.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete a product (admin)
+app.delete('/api/products/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query(
+            `DELETE FROM products WHERE id = $1 RETURNING id`, [id]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Product not found.' });
+        res.json({ message: 'Product deleted.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Find user by identifier (for forgot-password flow)
+app.post('/api/forgot-password/find', async (req, res) => {
+    const { identifier } = req.body;
+    if (!identifier) return res.status(400).json({ error: 'Identifier required.' });
+    try {
+        const result = await pool.query(
+            `SELECT u.id, u.email, p.phone FROM users u
+             LEFT JOIN profiles p ON u.id = p."userId"
+             WHERE u.username = $1 OR u.email = $1`,
+            [identifier]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Account not found.' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Reset password
+app.post('/api/reset-password', async (req, res) => {
+    const { identifier, newPassword } = req.body;
+    if (!identifier || !newPassword) return res.status(400).json({ error: 'Missing fields.' });
+    try {
+        const result = await pool.query(
+            `UPDATE users SET password = $1 WHERE username = $2 OR email = $2 RETURNING id`,
+            [newPassword, identifier]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Account not found.' });
+        res.json({ message: 'Password reset successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Start server after DB is ready
 initDB()
     .then(() => {
