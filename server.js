@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');                          // ← NEW: needed to read/write products_tmp.json
 const { Pool } = require('pg');
 
 const app = express();
@@ -18,15 +19,53 @@ const pool = new Pool({
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// products_tmp.json SYNC HELPERS
+// These two functions keep products_tmp.json in sync with the database
+// whenever a product is added, edited, or deleted from the admin panel.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PRODUCTS_TMP_PATH = path.join(__dirname, 'products_tmp.json');
+
+/**
+ * readProductsTmp()
+ * Safely reads and parses products_tmp.json.
+ * Handles two quirks of the original file:
+ *   1. UTF-16 LE BOM character (0xFEFF) at the start — stripped before parsing.
+ *   2. JavaScript-style // comments — stripped because JSON.parse() rejects them.
+ * Returns an empty array if the file is missing or unparseable.
+ */
+function readProductsTmp() {
+    try {
+        const raw = fs.readFileSync(PRODUCTS_TMP_PATH, 'utf8')
+            .replace(/^\uFEFF/, '')           // strip BOM
+            .replace(/\/\/[^\n]*/g, '');      // strip // comments
+        return JSON.parse(raw);
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * writeProductsTmp(products)
+ * Serialises the products array back to products_tmp.json as clean,
+ * formatted JSON (4-space indent). The // comments from the original
+ * file will not be re-added — the file becomes standard JSON going forward.
+ */
+function writeProductsTmp(products) {
+    fs.writeFileSync(PRODUCTS_TMP_PATH, JSON.stringify(products, null, 4), 'utf8');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Initialize tables and seed product data
 async function initDB() {
     const client = await pool.connect();
     try {
-        // Drop and recreate products table on every start (keeps catalog fresh)
-        await client.query(`DROP TABLE IF EXISTS products`);
-
+        // ← FIXED (from previous session): was DROP TABLE which wiped admin-added products on every restart.
+        // Now uses CREATE TABLE IF NOT EXISTS so existing rows are preserved.
         await client.query(`
-            CREATE TABLE products (
+            CREATE TABLE IF NOT EXISTS products (
                 id SERIAL PRIMARY KEY,
                 title TEXT UNIQUE NOT NULL,
                 price REAL NOT NULL,
@@ -365,7 +404,6 @@ app.post('/api/ratings', async (req, res) => {
     }
 });
 
-
 // Get all comments for a product
 app.get('/api/comments/:productTitle', async (req, res) => {
     const { productTitle } = req.params;
@@ -521,7 +559,10 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
     }
 });
 
-// Add a new product (admin)
+// ── Add a new product (admin) ────────────────────────────────────────────────
+// CHANGED: After a successful DB insert, the new product is also appended
+// to products_tmp.json so the flat file stays in sync with the database.
+// ────────────────────────────────────────────────────────────────────────────
 app.post('/api/products', requireAdmin, async (req, res) => {
     const { title, price, img, description, category } = req.body;
     if (!title || !price || !img || !description || !category) {
@@ -533,14 +574,28 @@ app.post('/api/products', requireAdmin, async (req, res) => {
              VALUES ($1, $2, $3, $4, $5) RETURNING id`,
             [title, price, img, description, category]
         );
-        res.status(201).json({ message: 'Product added.', id: result.rows[0].id });
+        const newDbId = result.rows[0].id;
+
+        // ── Sync to products_tmp.json ──────────────────────────────────────
+        // Read the current file, calculate the next id (max existing id + 1),
+        // push the new product, and write the file back.
+        const products = readProductsTmp();
+        const maxId = products.reduce((m, p) => Math.max(m, p.id || 0), 0);
+        products.push({ id: maxId + 1, title, price, img, description, category });
+        writeProductsTmp(products);
+        // ──────────────────────────────────────────────────────────────────
+
+        res.status(201).json({ message: 'Product added.', id: newDbId });
     } catch (err) {
         if (err.code === '23505') return res.status(400).json({ error: 'A product with this title already exists.' });
         res.status(500).json({ error: err.message });
     }
 });
 
-// Update a product (admin)
+// ── Update a product (admin) ─────────────────────────────────────────────────
+// CHANGED: After a successful DB update, the matching entry in
+// products_tmp.json is also updated in-place by matching on id.
+// ────────────────────────────────────────────────────────────────────────────
 app.put('/api/products/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
     const { title, price, img, description, category } = req.body;
@@ -551,13 +606,28 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
             [title, price, img, description, category, id]
         );
         if (!result.rows.length) return res.status(404).json({ error: 'Product not found.' });
+
+        // ── Sync to products_tmp.json ──────────────────────────────────────
+        // Find the product by id and overwrite only its fields,
+        // preserving the id and any other fields already in the file.
+        const products = readProductsTmp();
+        const idx = products.findIndex(p => String(p.id) === String(id));
+        if (idx !== -1) {
+            products[idx] = { ...products[idx], title, price, img, description, category };
+            writeProductsTmp(products);
+        }
+        // ──────────────────────────────────────────────────────────────────
+
         res.json({ message: 'Product updated.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// Delete a product (admin)
+// ── Delete a product (admin) ─────────────────────────────────────────────────
+// CHANGED: After a successful DB delete, the same product is removed
+// from products_tmp.json by filtering out the matching id.
+// ────────────────────────────────────────────────────────────────────────────
 app.delete('/api/products/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
     try {
@@ -565,6 +635,15 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
             `DELETE FROM products WHERE id = $1 RETURNING id`, [id]
         );
         if (!result.rows.length) return res.status(404).json({ error: 'Product not found.' });
+
+        // ── Sync to products_tmp.json ──────────────────────────────────────
+        // Remove the product with the matching id from the array and
+        // write the trimmed array back to the file.
+        const products = readProductsTmp();
+        const filtered = products.filter(p => String(p.id) !== String(id));
+        writeProductsTmp(filtered);
+        // ──────────────────────────────────────────────────────────────────
+
         res.json({ message: 'Product deleted.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
